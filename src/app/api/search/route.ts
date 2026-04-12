@@ -128,8 +128,10 @@ export async function POST(request: Request) {
         // Apply more filters
         if (filters.minAvgViews && (avgViews ?? 0) < filters.minAvgViews) return null
         if (filters.maxAvgViews && (avgViews ?? 0) > filters.maxAvgViews) return null
-        if (filters.niche && nicheCategory !== filters.niche) return null
-        if (filters.country && ch.snippet.country !== filters.country) return null
+        // Niche filter: soft match (don't filter if niche is 'other' or undetected)
+        if (filters.niche && nicheCategory && nicheCategory !== 'other' && nicheCategory !== filters.niche) return null
+        // Country filter: soft match (don't filter if channel has no country set)
+        if (filters.country && ch.snippet.country && ch.snippet.country !== filters.country) return null
 
         const channelData = {
           youtube_channel_id: ch.id,
