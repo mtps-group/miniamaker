@@ -61,50 +61,78 @@ export async function searchChannels(query: string, maxResults = 25, pageToken?:
 }
 
 /**
- * Recherche multi-stratégie : 3 requêtes parallèles pour maximiser les résultats.
- * - Sans filtre durée (inclut Shorts + vidéos longues)
- * - order=relevance + order=viewCount = résultats diversifiés
- * - regionCode pour prioriser le contenu local
- * Retourne jusqu'à ~100 channelIds uniques au lieu de ~25
+ * Recherche multi-stratégie : 2 requêtes parallèles pour maximiser les résultats.
+ * Fallback sur une requête simple si les deux échouent.
  */
 export async function multiSearchChannelsByVideos(
   query: string,
   regionCode?: string
 ): Promise<string[]> {
-  const frenchCountries = ['FR', 'BE', 'CA', 'CH', 'LU', 'MA', 'TN', 'DZ', 'SN']
-  const relevanceLanguage = regionCode && frenchCountries.includes(regionCode) ? 'fr' : 'fr'
+  const channelIdSet = new Set<string>()
 
-  const baseParams: Record<string, string> = {
+  // Stratégie 1 : pertinence (avec regionCode si fourni)
+  const params1: Record<string, string> = {
     part: 'snippet',
     type: 'video',
     q: query,
     maxResults: '50',
+    order: 'relevance',
+  }
+  if (regionCode) params1.regionCode = regionCode
+
+  // Stratégie 2 : popularité sans regionCode (attrape les chaînes sans pays renseigné)
+  const params2: Record<string, string> = {
+    part: 'snippet',
+    type: 'video',
+    q: query,
+    maxResults: '50',
+    order: 'viewCount',
   }
 
-  // 3 stratégies en parallèle
-  const strategies: Record<string, string>[] = [
-    // 1. Pertinence + région ciblée
-    { ...baseParams, order: 'relevance', ...(regionCode ? { regionCode } : {}), relevanceLanguage },
-    // 2. Popularité (différents résultats que relevance)
-    { ...baseParams, order: 'viewCount', ...(regionCode ? { regionCode } : {}), relevanceLanguage },
-    // 3. Pertinence sans regionCode (attrape les chaînes sans pays renseigné mais qui parlent français)
-    { ...baseParams, order: 'relevance', relevanceLanguage },
-  ]
+  const [res1, res2] = await Promise.allSettled([
+    fetchYouTube<YouTubeSearchResponse>('search', params1),
+    fetchYouTube<YouTubeSearchResponse>('search', params2),
+  ])
 
-  const searchResults = await Promise.allSettled(
-    strategies.map(params => fetchYouTube<YouTubeSearchResponse>('search', params))
-  )
+  if (res1.status === 'fulfilled') {
+    for (const item of res1.value.items || []) {
+      const cid = item.snippet?.channelId
+      if (cid) channelIdSet.add(cid)
+    }
+  } else {
+    console.error('[YouTube] Stratégie 1 échouée:', res1.reason)
+  }
 
-  const channelIdSet = new Set<string>()
-  for (const result of searchResults) {
-    if (result.status === 'fulfilled') {
-      for (const item of result.value.items || []) {
+  if (res2.status === 'fulfilled') {
+    for (const item of res2.value.items || []) {
+      const cid = item.snippet?.channelId
+      if (cid) channelIdSet.add(cid)
+    }
+  } else {
+    console.error('[YouTube] Stratégie 2 échouée:', res2.reason)
+  }
+
+  // Si les deux ont échoué, tenter un fallback simple
+  if (channelIdSet.size === 0) {
+    console.warn('[YouTube] Les 2 stratégies ont échoué, tentative fallback...')
+    try {
+      const fallback = await fetchYouTube<YouTubeSearchResponse>('search', {
+        part: 'snippet',
+        type: 'video',
+        q: query,
+        maxResults: '25',
+        order: 'relevance',
+      })
+      for (const item of fallback.items || []) {
         const cid = item.snippet?.channelId
         if (cid) channelIdSet.add(cid)
       }
+    } catch (e) {
+      console.error('[YouTube] Fallback aussi échoué:', e)
     }
   }
 
+  console.log(`[YouTube] multiSearch "${query}" → ${channelIdSet.size} chaînes uniques`)
   return Array.from(channelIdSet)
 }
 

@@ -49,15 +49,20 @@ export async function POST(request: Request) {
     }
     const regionCode = filters.country ? countryToRegion[filters.country] : undefined
 
-    // Recherche multi-stratégie : 3 requêtes parallèles → ~80-100 chaînes uniques
+    console.log(`[Search] query="${query}" regionCode=${regionCode}`)
+
+    // Recherche multi-stratégie : 2 requêtes parallèles → ~60-80 chaînes uniques
     const channelIds = await multiSearchChannelsByVideos(query.trim(), regionCode)
+    console.log(`[Search] ${channelIds.length} channelIds trouvés`)
 
     if (!channelIds.length) {
+      console.warn('[Search] Aucun channelId trouvé — quota YouTube dépassé ou clé invalide ?')
       return NextResponse.json({ channels: [], total: 0 })
     }
 
     // Récupérer les détails de toutes les chaînes en batch (très rapide : 1-2 appels API)
     const channelDetails = await getChannelDetails(channelIds)
+    console.log(`[Search] ${channelDetails.length} chaînes avec détails`)
 
     // Appliquer les filtres d'abonnés
     const filteredDetails = channelDetails.filter(ch => {
@@ -66,6 +71,7 @@ export async function POST(request: Request) {
       if (filters.maxSubscribers && subs > filters.maxSubscribers) return false
       return true
     })
+    console.log(`[Search] ${filteredDetails.length} chaînes après filtre abonnés`)
 
     if (!filteredDetails.length) {
       return NextResponse.json({ channels: [], total: 0 })
