@@ -38,14 +38,15 @@ export default function RecherchePage() {
 
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault()
-    if (!query.trim()) return
+    // Si pas de mot-clé, on utilise la niche ou le pays comme mot-clé automatique
+    const autoQuery = query.trim() || filters.niche || filters.country || 'youtube'
     setLoading(true)
     setSearched(true)
     try {
       const res = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: query.trim(), filters }),
+        body: JSON.stringify({ query: autoQuery, filters }),
       })
       const data = await res.json()
       if (!res.ok) {
@@ -103,7 +104,7 @@ export default function RecherchePage() {
             <input
               value={query}
               onChange={e => setQuery(e.target.value)}
-              placeholder="Ex: gaming, tech review, cuisine française, fitness..."
+              placeholder="Optionnel — laissez vide pour rechercher par filtres uniquement"
               className="w-full pl-10 pr-4 py-2.5 bg-[#1a1a1a] border border-white/8 rounded-xl text-sm text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-500/50 transition-all"
             />
           </div>
@@ -120,7 +121,7 @@ export default function RecherchePage() {
               </span>
             )}
           </Button>
-          <Button type="submit" loading={loading} disabled={!query.trim()}>
+          <Button type="submit" loading={loading}>
             <Search className="w-4 h-4" />
             Rechercher
           </Button>
