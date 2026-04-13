@@ -3,13 +3,14 @@ import { createClient } from '@/lib/supabase/server'
 import { PLANS } from '@/lib/constants'
 import { computeProspectScore } from '@/lib/scoring'
 import {
-  searchChannelsByVideos,
+  multiSearchChannelsByVideos,
   getChannelDetails,
-  getRecentVideos,
+  getRecentVideosForChannels,
   computeAvgViews,
   computeUploadFrequency,
   detectNiche,
 } from '@/lib/youtube/client'
+import type { YouTubeVideoItem } from '@/lib/youtube/types'
 import type { SearchFilters } from '@/types'
 
 export async function POST(request: Request) {
@@ -28,7 +29,7 @@ export async function POST(request: Request) {
 
     const plan = PLANS[profile.plan as keyof typeof PLANS] || PLANS.free
 
-    // Check search limit for free plan
+    // Vérifier la limite de recherches
     if (
       plan.maxSearchesLifetime !== Infinity &&
       profile.total_searches_used >= plan.maxSearchesLifetime
@@ -45,89 +46,112 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Requête vide' }, { status: 400 })
     }
 
-    // Cherche des chaînes via les vidéos (trouve des créateurs de contenu sur ce thème)
-    const channelIds = await searchChannelsByVideos(query.trim(), 50)
+    // Mapper le code pays vers regionCode YouTube
+    const countryToRegion: Record<string, string> = {
+      FR: 'FR', BE: 'BE', CA: 'CA', CH: 'CH', LU: 'LU',
+      MA: 'MA', TN: 'TN', DZ: 'DZ', SN: 'SN',
+    }
+    const regionCode = filters.country ? countryToRegion[filters.country] : undefined
+
+    // Recherche multi-stratégie : 3 requêtes parallèles → ~80-100 chaînes uniques
+    const channelIds = await multiSearchChannelsByVideos(query.trim(), regionCode)
 
     if (!channelIds.length) {
       return NextResponse.json({ channels: [], total: 0 })
     }
 
-    // Get detailed channel info (batch request)
+    // Récupérer les détails de toutes les chaînes en batch
     const channelDetails = await getChannelDetails(channelIds)
 
-    // Process each channel
+    // Appliquer les filtres d'abonnés en amont pour éviter les appels API inutiles
+    const filteredDetails = channelDetails.filter(ch => {
+      const subs = parseInt(ch.statistics?.subscriberCount || '0')
+      if (filters.minSubscribers && subs < filters.minSubscribers) return false
+      if (filters.maxSubscribers && subs > filters.maxSubscribers) return false
+      return true
+    })
+
+    if (!filteredDetails.length) {
+      return NextResponse.json({ channels: [], total: 0 })
+    }
+
+    // Vérifier le cache pour chaque chaîne
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+    const { data: cachedChannels } = await supabase
+      .from('channels')
+      .select('*')
+      .in('youtube_channel_id', filteredDetails.map(ch => ch.id))
+
+    const cacheMap = new Map((cachedChannels || []).map(c => [c.youtube_channel_id, c]))
+
+    // Identifier les chaînes qui ont besoin d'être mises à jour
+    const channelsNeedingVideos = filteredDetails
+      .filter(ch => {
+        const cached = cacheMap.get(ch.id)
+        return !cached || cached.last_synced_at < sevenDaysAgo
+      })
+      .map(ch => ({
+        channelId: ch.id,
+        // Playlist uploads = 2 unités de quota au lieu de 101 (search+videos)
+        uploadsPlaylistId: ch.contentDetails?.relatedPlaylists?.uploads,
+      }))
+
+    // Récupérer les vidéos en parallèle (concurrence limitée à 5)
+    const videosMap = channelsNeedingVideos.length > 0
+      ? await getRecentVideosForChannels(channelsNeedingVideos, 10, 5)
+      : new Map()
+
+    // Traiter chaque chaîne
     const processedChannels = await Promise.all(
-      channelDetails.map(async (ch) => {
+      filteredDetails.map(async (ch) => {
         const subscriberCount = parseInt(ch.statistics?.subscriberCount || '0')
         const viewCount = parseInt(ch.statistics?.viewCount || '0')
         const videoCount = parseInt(ch.statistics?.videoCount || '0')
 
-        // Apply subscriber filter early to avoid unnecessary API calls
-        if (filters.minSubscribers && subscriberCount < filters.minSubscribers) return null
-        if (filters.maxSubscribers && subscriberCount > filters.maxSubscribers) return null
-
-        // Check cache first
-        const { data: cached } = await supabase
-          .from('channels')
-          .select('*')
-          .eq('youtube_channel_id', ch.id)
-          .single()
-
-        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+        const cached = cacheMap.get(ch.id)
         const isFresh = cached && cached.last_synced_at > sevenDaysAgo
 
         let avgViews = cached?.avg_views_last_10 ?? null
         let uploadFrequency = cached?.upload_frequency_days ?? null
         let nicheCategory = cached?.niche_category ?? null
 
-        // Fetch videos if cache is stale or missing
-        if (!isFresh) {
-          try {
-            const videos = await getRecentVideos(ch.id, 10)
-            avgViews = computeAvgViews(videos)
-            uploadFrequency = computeUploadFrequency(videos)
-            nicheCategory = detectNiche(
-              ch.snippet.description || '',
-              videos.map(v => v.snippet.title)
-            )
+        // Utiliser les vidéos récupérées en batch
+        const videos = videosMap.get(ch.id)
+        if (!isFresh && videos !== undefined) {
+          avgViews = computeAvgViews(videos)
+          uploadFrequency = computeUploadFrequency(videos)
+          nicheCategory = detectNiche(
+            ch.snippet.description || '',
+            videos.map((v: YouTubeVideoItem) => v.snippet.title)
+          )
 
-            // Cache videos
-            if (videos.length > 0) {
-              const { data: channelRow } = await supabase
-                .from('channels')
-                .select('id')
-                .eq('youtube_channel_id', ch.id)
-                .single()
-
-              if (channelRow) {
-                const videoRows = videos.map(v => ({
-                  channel_id: channelRow.id,
-                  youtube_video_id: v.id,
-                  title: v.snippet.title,
-                  thumbnail_url: v.snippet.thumbnails?.medium?.url || v.snippet.thumbnails?.default?.url,
-                  thumbnail_maxres_url: v.snippet.thumbnails?.maxres?.url,
-                  view_count: parseInt(v.statistics?.viewCount || '0'),
-                  like_count: parseInt(v.statistics?.likeCount || '0'),
-                  comment_count: parseInt(v.statistics?.commentCount || '0'),
-                  published_at: v.snippet.publishedAt,
-                }))
-                await supabase.from('channel_videos').upsert(videoRows, { onConflict: 'youtube_video_id' })
-              }
-            }
-          } catch {
-            // Use defaults if video fetch fails
-            avgViews = avgViews ?? 0
-            uploadFrequency = uploadFrequency ?? 30
-            nicheCategory = nicheCategory ?? 'other'
+          // Mettre en cache les vidéos (fire and forget)
+          if (videos.length > 0 && cached?.id) {
+            const videoRows = videos.map((v: YouTubeVideoItem) => ({
+              channel_id: cached.id,
+              youtube_video_id: v.id,
+              title: v.snippet.title,
+              thumbnail_url: v.snippet.thumbnails?.medium?.url || v.snippet.thumbnails?.default?.url,
+              thumbnail_maxres_url: v.snippet.thumbnails?.maxres?.url,
+              view_count: parseInt(v.statistics?.viewCount || '0'),
+              like_count: parseInt(v.statistics?.likeCount || '0'),
+              comment_count: parseInt(v.statistics?.commentCount || '0'),
+              published_at: v.snippet.publishedAt,
+            }))
+            supabase
+              .from('channel_videos')
+              .upsert(videoRows, { onConflict: 'youtube_video_id' })
+              .then(() => {})
           }
+        } else if (!isFresh) {
+          avgViews = avgViews ?? 0
+          uploadFrequency = uploadFrequency ?? 30
+          nicheCategory = nicheCategory ?? 'other'
         }
 
-        // Apply more filters
+        // Filtre vues moyennes
         if (filters.minAvgViews && (avgViews ?? 0) < filters.minAvgViews) return null
         if (filters.maxAvgViews && (avgViews ?? 0) > filters.maxAvgViews) return null
-        // Niche: utilisée uniquement comme mot-clé de recherche, pas comme filtre strict
-        // Country: utilisé comme mot-clé uniquement (ex: "business france")
-        // Le filtre strict est supprimé car beaucoup de chaînes n'ont pas de pays renseigné sur YouTube
 
         const channelData = {
           youtube_channel_id: ch.id,
@@ -149,7 +173,7 @@ export async function POST(request: Request) {
           last_synced_at: new Date().toISOString(),
         }
 
-        // Upsert channel into cache
+        // Upsert dans le cache
         const { data: upserted } = await supabase
           .from('channels')
           .upsert(channelData, { onConflict: 'youtube_channel_id' })
@@ -158,17 +182,19 @@ export async function POST(request: Request) {
 
         const fullChannel = { ...(upserted || channelData), id: upserted?.id || cached?.id }
 
-        // Compute prospect score
+        // Score prospect
         const score = computeProspectScore(fullChannel as Parameters<typeof computeProspectScore>[0])
 
         return { ...fullChannel, prospect_score: score.total, scoreDetails: score }
       })
     )
 
-    // Filter nulls
-    const validChannels = processedChannels.filter(Boolean)
+    // Filtrer les nulls et trier par score
+    const validChannels = processedChannels
+      .filter(Boolean)
+      .sort((a, b) => (b!.prospect_score ?? 0) - (a!.prospect_score ?? 0))
 
-    // Save search record
+    // Enregistrer la recherche
     const { data: searchRecord } = await supabase
       .from('searches')
       .insert({
@@ -180,7 +206,7 @@ export async function POST(request: Request) {
       .select()
       .single()
 
-    // Save search results
+    // Enregistrer les résultats
     if (searchRecord && validChannels.length > 0) {
       const resultRows = validChannels
         .filter(ch => ch?.id)
@@ -195,15 +221,15 @@ export async function POST(request: Request) {
       }
     }
 
-    // Increment search counter
+    // Incrémenter le compteur de recherches
     await supabase
       .from('profiles')
       .update({ total_searches_used: profile.total_searches_used + 1 })
       .eq('id', user.id)
 
-    // Apply visibility limit for free plan
+    // Appliquer la limite de visibilité selon le plan
     const visibleCount = plan.visibleResults
-    const channels = validChannels.slice(0, 50).map((ch, index) => ({
+    const channels = validChannels.slice(0, 100).map((ch, index) => ({
       ...ch,
       isBlurred: index >= visibleCount,
     }))

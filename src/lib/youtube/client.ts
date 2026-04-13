@@ -24,6 +24,30 @@ async function fetchYouTube<T>(endpoint: string, params: Record<string, string>)
   return res.json()
 }
 
+// Limiteur de concurrence pour éviter les rate limits
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  maxConcurrent: number
+): Promise<(T | null)[]> {
+  const results: (T | null)[] = new Array(tasks.length).fill(null)
+  let index = 0
+
+  async function worker() {
+    while (index < tasks.length) {
+      const i = index++
+      try {
+        results[i] = await tasks[i]()
+      } catch {
+        results[i] = null
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(maxConcurrent, tasks.length) }, worker)
+  await Promise.all(workers)
+  return results
+}
+
 export async function searchChannels(query: string, maxResults = 25, pageToken?: string): Promise<YouTubeSearchResponse> {
   const params: Record<string, string> = {
     part: 'snippet',
@@ -36,8 +60,55 @@ export async function searchChannels(query: string, maxResults = 25, pageToken?:
   return fetchYouTube<YouTubeSearchResponse>('search', params)
 }
 
-// Cherche des chaînes via les vidéos — trouve des chaînes qui FONT du contenu sur ce mot-clé
-// plutôt que des chaînes qui ont ce mot dans leur nom
+/**
+ * Recherche multi-stratégie : 3 requêtes parallèles pour maximiser les résultats.
+ * - Sans filtre durée (inclut Shorts + vidéos longues)
+ * - order=relevance + order=viewCount = résultats diversifiés
+ * - regionCode pour prioriser le contenu local
+ * Retourne jusqu'à ~100 channelIds uniques au lieu de ~25
+ */
+export async function multiSearchChannelsByVideos(
+  query: string,
+  regionCode?: string
+): Promise<string[]> {
+  const frenchCountries = ['FR', 'BE', 'CA', 'CH', 'LU', 'MA', 'TN', 'DZ', 'SN']
+  const relevanceLanguage = regionCode && frenchCountries.includes(regionCode) ? 'fr' : 'fr'
+
+  const baseParams: Record<string, string> = {
+    part: 'snippet',
+    type: 'video',
+    q: query,
+    maxResults: '50',
+  }
+
+  // 3 stratégies en parallèle
+  const strategies: Record<string, string>[] = [
+    // 1. Pertinence + région ciblée
+    { ...baseParams, order: 'relevance', ...(regionCode ? { regionCode } : {}), relevanceLanguage },
+    // 2. Popularité (différents résultats que relevance)
+    { ...baseParams, order: 'viewCount', ...(regionCode ? { regionCode } : {}), relevanceLanguage },
+    // 3. Pertinence sans regionCode (attrape les chaînes sans pays renseigné mais qui parlent français)
+    { ...baseParams, order: 'relevance', relevanceLanguage },
+  ]
+
+  const searchResults = await Promise.allSettled(
+    strategies.map(params => fetchYouTube<YouTubeSearchResponse>('search', params))
+  )
+
+  const channelIdSet = new Set<string>()
+  for (const result of searchResults) {
+    if (result.status === 'fulfilled') {
+      for (const item of result.value.items || []) {
+        const cid = item.snippet?.channelId
+        if (cid) channelIdSet.add(cid)
+      }
+    }
+  }
+
+  return Array.from(channelIdSet)
+}
+
+// Ancienne fonction conservée pour compatibilité
 export async function searchChannelsByVideos(query: string, maxResults = 50): Promise<string[]> {
   const params: Record<string, string> = {
     part: 'snippet',
@@ -45,10 +116,8 @@ export async function searchChannelsByVideos(query: string, maxResults = 50): Pr
     q: query,
     maxResults: maxResults.toString(),
     order: 'relevance',
-    videoDuration: 'medium', // évite les shorts
   }
   const data = await fetchYouTube<YouTubeSearchResponse>('search', params)
-  // Extraire les channelIds uniques
   const channelIds = [...new Set(
     (data.items || [])
       .map(item => item.snippet?.channelId)
@@ -89,6 +158,66 @@ export async function getChannelById(channelId: string): Promise<YouTubeChannelI
     id: channelId,
   })
   return data.items?.[0] || null
+}
+
+/**
+ * Récupère les vidéos récentes via la playlist "uploads".
+ * BEAUCOUP moins coûteux : 2 unités au lieu de 101.
+ * (playlistItems = 1 unité, videos = 1 unité pour jusqu'à 50 IDs)
+ */
+export async function getRecentVideosViaPlaylist(
+  uploadsPlaylistId: string,
+  maxResults = 10
+): Promise<YouTubeVideoItem[]> {
+  const playlistData = await fetchYouTube<{
+    items?: Array<{ contentDetails?: { videoId?: string } }>
+  }>('playlistItems', {
+    part: 'contentDetails',
+    playlistId: uploadsPlaylistId,
+    maxResults: maxResults.toString(),
+  })
+
+  const videoIds = (playlistData.items || [])
+    .map(item => item.contentDetails?.videoId)
+    .filter((id): id is string => !!id)
+
+  if (!videoIds.length) return []
+
+  const videoData = await fetchYouTube<YouTubeVideoResponse>('videos', {
+    part: 'snippet,statistics,contentDetails',
+    id: videoIds.join(','),
+  })
+
+  return videoData.items || []
+}
+
+/**
+ * Récupère les vidéos pour plusieurs chaînes en parallèle (concurrence limitée à 5).
+ * Utilise la playlist uploads si disponible pour économiser le quota.
+ */
+export async function getRecentVideosForChannels(
+  channels: Array<{ channelId: string; uploadsPlaylistId?: string }>,
+  maxResults = 10,
+  maxConcurrent = 5
+): Promise<Map<string, YouTubeVideoItem[]>> {
+  const resultsMap = new Map<string, YouTubeVideoItem[]>()
+
+  const tasks = channels.map(({ channelId, uploadsPlaylistId }) => async () => {
+    let videos: YouTubeVideoItem[]
+    if (uploadsPlaylistId) {
+      videos = await getRecentVideosViaPlaylist(uploadsPlaylistId, maxResults)
+    } else {
+      videos = await getRecentVideos(channelId, maxResults)
+    }
+    return { channelId, videos }
+  })
+
+  const fetched = await runWithConcurrency(tasks, maxConcurrent)
+  for (const result of fetched) {
+    if (result) resultsMap.set(result.channelId, result.videos)
+  }
+
+  return resultsMap
 }
 
 export async function getRecentVideos(channelId: string, maxResults = 10): Promise<YouTubeVideoItem[]> {
