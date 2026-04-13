@@ -136,8 +136,12 @@ export async function multiSearchChannelsByVideos(
   return Array.from(channelIdSet)
 }
 
-// Ancienne fonction conservée pour compatibilité
-export async function searchChannelsByVideos(query: string, maxResults = 50): Promise<string[]> {
+// Recherche simple et fiable — 1 seul appel API (100 unités)
+export async function searchChannelsByVideos(
+  query: string,
+  maxResults = 50,
+  regionCode?: string
+): Promise<string[]> {
   const params: Record<string, string> = {
     part: 'snippet',
     type: 'video',
@@ -145,6 +149,8 @@ export async function searchChannelsByVideos(query: string, maxResults = 50): Pr
     maxResults: maxResults.toString(),
     order: 'relevance',
   }
+  if (regionCode) params.regionCode = regionCode
+
   const data = await fetchYouTube<YouTubeSearchResponse>('search', params)
   const channelIds = [...new Set(
     (data.items || [])
