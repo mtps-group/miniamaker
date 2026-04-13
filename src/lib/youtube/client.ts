@@ -36,6 +36,27 @@ export async function searchChannels(query: string, maxResults = 25, pageToken?:
   return fetchYouTube<YouTubeSearchResponse>('search', params)
 }
 
+// Cherche des chaînes via les vidéos — trouve des chaînes qui FONT du contenu sur ce mot-clé
+// plutôt que des chaînes qui ont ce mot dans leur nom
+export async function searchChannelsByVideos(query: string, maxResults = 50): Promise<string[]> {
+  const params: Record<string, string> = {
+    part: 'snippet',
+    type: 'video',
+    q: query,
+    maxResults: maxResults.toString(),
+    order: 'relevance',
+    videoDuration: 'medium', // évite les shorts
+  }
+  const data = await fetchYouTube<YouTubeSearchResponse>('search', params)
+  // Extraire les channelIds uniques
+  const channelIds = [...new Set(
+    (data.items || [])
+      .map(item => item.snippet?.channelId)
+      .filter((id): id is string => !!id)
+  )]
+  return channelIds
+}
+
 export async function getChannelDetails(channelIds: string[]): Promise<YouTubeChannelItem[]> {
   const chunks: string[][] = []
   for (let i = 0; i < channelIds.length; i += 50) {

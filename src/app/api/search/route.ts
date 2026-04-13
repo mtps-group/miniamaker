@@ -3,7 +3,7 @@ import { createClient } from '@/lib/supabase/server'
 import { PLANS } from '@/lib/constants'
 import { computeProspectScore } from '@/lib/scoring'
 import {
-  searchChannels,
+  searchChannelsByVideos,
   getChannelDetails,
   getRecentVideos,
   computeAvgViews,
@@ -45,11 +45,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Requête vide' }, { status: 400 })
     }
 
-    // Search YouTube for channels
-    const searchResponse = await searchChannels(query.trim(), 25)
-    const channelIds = (searchResponse.items || [])
-      .map(item => item.snippet?.channelId || item.id?.channelId)
-      .filter(Boolean) as string[]
+    // Cherche des chaînes via les vidéos (trouve des créateurs de contenu sur ce thème)
+    const channelIds = await searchChannelsByVideos(query.trim(), 50)
 
     if (!channelIds.length) {
       return NextResponse.json({ channels: [], total: 0 })
