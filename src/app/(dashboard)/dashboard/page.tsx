@@ -35,7 +35,14 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true)
   const supabase = createClient()
 
-  useEffect(() => { if (user) fetchStats() }, [user])
+  useEffect(() => {
+    if (user) {
+      fetchStats()
+    } else if (user === null) {
+      // user explicitement null = non connecté, arrêter le loading
+      setLoading(false)
+    }
+  }, [user])
 
   const fetchStats = async () => {
     if (!user) return
