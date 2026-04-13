@@ -129,8 +129,8 @@ export async function POST(request: Request) {
         if (filters.minAvgViews && (avgViews ?? 0) < filters.minAvgViews) return null
         if (filters.maxAvgViews && (avgViews ?? 0) > filters.maxAvgViews) return null
         // Niche: utilisée uniquement comme mot-clé de recherche, pas comme filtre strict
-        // Country filter: soft match (don't filter if channel has no country set)
-        if (filters.country && ch.snippet.country && ch.snippet.country !== filters.country) return null
+        // Country: utilisé comme mot-clé uniquement (ex: "business france")
+        // Le filtre strict est supprimé car beaucoup de chaînes n'ont pas de pays renseigné sur YouTube
 
         const channelData = {
           youtube_channel_id: ch.id,

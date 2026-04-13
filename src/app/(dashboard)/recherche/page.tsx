@@ -39,7 +39,10 @@ export default function RecherchePage() {
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault()
     // Si pas de mot-clé, on utilise la niche ou le pays comme mot-clé automatique
-    const autoQuery = query.trim() || filters.niche || filters.country || 'youtube'
+    // Combine niche + pays comme mots-clés si barre vide
+    const nicheTerm = filters.niche || ''
+    const countryTerm = filters.country === 'FR' ? 'france' : filters.country === 'BE' ? 'belgique' : filters.country === 'CA' ? 'canada' : filters.country === 'CH' ? 'suisse' : ''
+    const autoQuery = query.trim() || [nicheTerm, countryTerm].filter(Boolean).join(' ') || 'youtube'
     setLoading(true)
     setSearched(true)
     try {
